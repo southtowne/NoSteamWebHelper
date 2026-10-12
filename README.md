@@ -13,7 +13,7 @@ build is also available for people who don't just want the processes gone outrig
 # Usage
 Simply follow the quick and easy steps below ↓
 
-1. Download [Release.zip](https://github.com/southtowne/NoSteamWebHelper/releases/download/Steam/Release.zip).
+1. Download [Release.zip](https://github.com/southtowne/NoSteamWebHelper/releases/download/web/Release.zip).
 2. Right-click & extract.
 3. Close Steam completely.
 4. Copy umpdc.dll from the park folder (or kill, if that's what you want) into your Steam install directory, next to steam.exe.
