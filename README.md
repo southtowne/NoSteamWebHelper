@@ -8,7 +8,7 @@ https://github.com/Aetopia/NoSteamWebHelper (removed; source recovered from Wayb
 https://github.com/xowny/NoSteamWebHelper-Reloaded
 
 It keeps Steam's browser stack available while idle, then automatically parks steamwebhelper.exe while Steam is running a game, instead of suspending or killing it like the original did. An optional kill mode
-build is also available for people who don't just want the processes gone outright.
+build is also available.
 
 # Usage
 Simply follow the quick and easy steps below ↓
