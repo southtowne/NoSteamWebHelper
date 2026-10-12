@@ -133,22 +133,14 @@ static DWORD WINAPI RetrimProc(LPVOID lpParameter)
 
 #endif
 
-// fires for every window steam.exe creates. we only care about the moment the real steam
-// window shows up (vguiPopupWindow with an actual title, not one of the dozens of throwaway
-// popups steam spawns constantly), that's our signal steam is up and we can start watching it
-static VOID CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild,
-                                  DWORD dwEventThread, DWORD dwmsEventTime)
+// this used to be the tail end of WinEventProc itself, blocking forever inside the raw hook
+// callback. that's the kind of thing that can blow the stack if steam ever re-enters the
+// callback for another matching window while the first call is still parked in here (the
+// upstream NoSteamWebHelper fork hit exactly this crash on newer steam builds), so now it's
+// its own thread and WinEventProc just kicks it off and returns right away
+static DWORD WINAPI MonitorProc(LPVOID lpParameter)
 {
-    WCHAR szClassName[16] = {};
-    GetClassNameW(hwnd, szClassName, 16);
-
-    if (CompareStringOrdinal(L"vguiPopupWindow", -1, szClassName, -1, FALSE) != CSTR_EQUAL ||
-        GetWindowTextLengthW(hwnd) < 1)
-        return;
-
-    // steam only creates one titled vguiPopupWindow per run, at startup, so in practice this
-    // only fires once and we're safe spinning up the tray icon here without extra guards
-    CloseHandle(CreateThread(NULL, 0, ThreadProc, (LPVOID)FALSE, 0, NULL));
+    (VOID)lpParameter;
 
     HKEY hKey = NULL;
     RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE\\Valve\\Steam", REG_OPTION_NON_VOLATILE, KEY_NOTIFY | KEY_QUERY_VALUE,
@@ -241,6 +233,25 @@ static VOID CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
             bParked = FALSE;
         }
     }
+    return EXIT_SUCCESS;
+}
+
+// fires for every window steam.exe creates. we only care about the moment the real steam
+// window shows up (vguiPopupWindow with an actual title, not one of the dozens of throwaway
+// popups steam spawns constantly), that's our signal steam is up and we can start watching it.
+// this has to stay quick and return promptly, see the comment on MonitorProc above for why
+static VOID CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd, LONG idObject, LONG idChild,
+                                  DWORD dwEventThread, DWORD dwmsEventTime)
+{
+    WCHAR szClassName[16] = {};
+    GetClassNameW(hwnd, szClassName, 16);
+
+    if (CompareStringOrdinal(L"vguiPopupWindow", -1, szClassName, -1, FALSE) != CSTR_EQUAL ||
+        GetWindowTextLengthW(hwnd) < 1)
+        return;
+
+    CloseHandle(CreateThread(NULL, 0, ThreadProc, (LPVOID)FALSE, 0, NULL));
+    CloseHandle(CreateThread(NULL, 0, MonitorProc, NULL, 0, NULL));
 }
 
 static DWORD WINAPI ThreadProc(LPVOID lpParameter)
@@ -264,6 +275,25 @@ static DWORD WINAPI ThreadProc(LPVOID lpParameter)
     return EXIT_SUCCESS;
 }
 
+// steam.exe isn't the only thing in its own install directory that can end up probing for
+// umpdc.dll through the same search order trick we're relying on. steamwebhelper.exe lives
+// right there too, so without this check every single webhelper process would also load us
+// and spin up its own copy of all this, watching itself for no reason
+static BOOL IsSteamExe(VOID)
+{
+    WCHAR path[MAX_PATH];
+    DWORD len = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (!len || len >= MAX_PATH)
+        return FALSE;
+
+    WCHAR *name = path;
+    for (WCHAR *p = path; *p; p++)
+        if (*p == L'\\')
+            name = p + 1;
+
+    return CompareStringOrdinal(name, -1, L"steam.exe", -1, TRUE) == CSTR_EQUAL;
+}
+
 // this is why the output has to be named umpdc.dll. steam.exe probes for the real umpdc.dll
 // (a system32 power management dll it doesn't actually need) using the normal windows dll
 // search order, which checks the app's own directory first. drop our dll there under that
@@ -277,7 +307,8 @@ BOOL WINAPI DllMainCRTStartup(HINSTANCE hLibModule, DWORD dwReason, LPVOID lpRes
     if (dwReason == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hLibModule);
-        CloseHandle(CreateThread(NULL, 0, ThreadProc, (LPVOID)TRUE, 0, NULL));
+        if (IsSteamExe())
+            CloseHandle(CreateThread(NULL, 0, ThreadProc, (LPVOID)TRUE, 0, NULL));
     }
     return TRUE;
 }
