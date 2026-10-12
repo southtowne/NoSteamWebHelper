@@ -6,7 +6,6 @@
 #include <winternl.h>
 
 #define MAX_HELPERS 64
-#define TRIM_INTERVAL_MS 1000
 
 static DWORD WINAPI ThreadProc(LPVOID lpParameter);
 
@@ -77,15 +76,6 @@ static VOID Unpark(HANDLE hProcess)
 
 #else
 
-static volatile LONG g_epoch = 0;
-
-typedef struct
-{
-    HANDLE h[MAX_HELPERS];
-    DWORD n;
-    LONG epoch;
-} TRIM_CTX;
-
 static VOID Park(HANDLE hProcess)
 {
     SetPriorityClass(hProcess, BELOW_NORMAL_PRIORITY_CLASS);
@@ -112,26 +102,64 @@ static VOID Unpark(HANDLE hProcess)
                            sizeof(MEMORY_PRIORITY_INFORMATION));
 }
 
-// keeps trimming the parked processes' working sets while the game runs. the epoch check is
-// how it knows to stop, when the game exits the main loop bumps g_epoch and this thread notices
-// on its next wakeup and bails before touching handles that are about to get closed
-static DWORD WINAPI RetrimProc(LPVOID lpParameter)
-{
-    TRIM_CTX *ctx = (TRIM_CTX *)lpParameter;
-
-    while (ctx->epoch == g_epoch)
-    {
-        Sleep(TRIM_INTERVAL_MS);
-        if (ctx->epoch != g_epoch)
-            break;
-        for (DWORD i = {}; i < ctx->n; i++)
-            SetProcessWorkingSetSize(ctx->h[i], (SIZE_T)-1, (SIZE_T)-1);
-    }
-    HeapFree(GetProcessHeap(), 0, ctx);
-    return EXIT_SUCCESS;
-}
-
 #endif
+
+// snapshots every steamwebhelper.exe descended from steam.exe right now and parks each one.
+// returns how many it opened into hOut, caller closes those handles whenever it's done with
+// them. called every time MonitorProc sees the app is running, not just the first time, so
+// it also doubles as the re-sweep that catches anything steam brings back later
+static DWORD ParkDescendants(HANDLE *hOut)
+{
+    WTS_PROCESS_INFOW *pProcessInfo = {};
+    DWORD $ = {};
+    WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pProcessInfo, &$);
+
+    DWORD pid[MAX_HELPERS], parent[MAX_HELPERS], n = 0;
+    for (DWORD i = {}; i < $ && n < MAX_HELPERS; i++)
+        if (CompareStringOrdinal(pProcessInfo[i].pProcessName, -1, L"steamwebhelper.exe", -1, TRUE) == CSTR_EQUAL)
+        {
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pProcessInfo[i].ProcessId);
+            PROCESS_BASIC_INFORMATION pbi = {};
+            NtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), NULL);
+            CloseHandle(hProcess);
+
+            pid[n] = pProcessInfo[i].ProcessId;
+            parent[n] = (DWORD)pbi.InheritedFromUniqueProcessId;
+            n++;
+        }
+    WTSFreeMemory(pProcessInfo);
+
+    // not every webhelper process is a direct child of steam.exe, some are spawned by other
+    // webhelper processes (sandboxed renderers and the like), so we walk the whole chain
+    // instead of just checking the immediate parent. n is small (a handful of processes), so
+    // the extra passes here cost nothing
+    BOOL rooted[MAX_HELPERS] = {};
+    for (DWORD i = {}; i < n; i++)
+        rooted[i] = parent[i] == GetCurrentProcessId();
+    for (DWORD pass = {}; pass < n; pass++)
+        for (DWORD i = {}; i < n; i++)
+            if (!rooted[i])
+                for (DWORD j = {}; j < n; j++)
+                    if (rooted[j] && parent[i] == pid[j])
+                        rooted[i] = TRUE;
+
+    DWORD cParked = 0;
+    for (DWORD i = {}; i < n && cParked < MAX_HELPERS; i++)
+        if (rooted[i])
+        {
+            // PROCESS_TERMINATE is only used by the kill mode build, harmless to request it
+            // here too since this file is shared between both builds
+            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION |
+                                               PROCESS_SET_QUOTA | PROCESS_TERMINATE,
+                                           FALSE, pid[i]);
+            if (hProcess)
+            {
+                Park(hProcess);
+                hOut[cParked++] = hProcess;
+            }
+        }
+    return cParked;
+}
 
 // this used to be the tail end of WinEventProc itself, blocking forever inside the raw hook
 // callback. that's the kind of thing that can blow the stack if steam ever re-enters the
@@ -140,98 +168,104 @@ static DWORD WINAPI RetrimProc(LPVOID lpParameter)
 // its own thread and WinEventProc just kicks it off and returns right away
 static DWORD WINAPI MonitorProc(LPVOID lpParameter)
 {
+#ifdef KILL_MODE
+    // killing webhelper alone doesn't stick: steam's own self-healing notices it's gone and
+    // relaunches it within a couple seconds, with no registry write we can catch to react to.
+    // that self-healing runs on steam's main thread, the same one that owns the window
+    // WinEventProc fired for, so suspending it (same as the original project did) stops steam
+    // from ever noticing webhelper died at all. this is the one place park mode and kill mode
+    // genuinely can't both get what they want: staying dead requires freezing this thread,
+    // which is the same thing that made the original project's steam window hang. acceptable
+    // trade here specifically because kill mode is for people who don't use the overlay or
+    // touch steam's window while gaming anyway
+    HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, (DWORD)(ULONG_PTR)lpParameter);
+#else
     (VOID)lpParameter;
-
-    HKEY hKey = NULL;
-    RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE\\Valve\\Steam", REG_OPTION_NON_VOLATILE, KEY_NOTIFY | KEY_QUERY_VALUE,
-                  &hKey);
+#endif
 
     HANDLE hParked[MAX_HELPERS] = {};
     DWORD cParked = 0;
     BOOL bParked = FALSE;
 
-    while (!RegNotifyChangeKeyValue(hKey, FALSE, REG_NOTIFY_CHANGE_LAST_SET, NULL, FALSE))
-    {
-        BOOL _ = FALSE;
-        RegGetValueW(hKey, NULL, L"RunningAppID", RRF_RT_REG_DWORD, NULL, (PVOID)&_, &((DWORD){sizeof(BOOL)}));
-
-        if (_ && !bParked)
-        {
-            WTS_PROCESS_INFOW *pProcessInfo = {};
-            DWORD $ = {};
-            WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pProcessInfo, &$);
-
-            DWORD pid[MAX_HELPERS], parent[MAX_HELPERS], n = 0;
-            for (DWORD i = {}; i < $ && n < MAX_HELPERS; i++)
-                if (CompareStringOrdinal(pProcessInfo[i].pProcessName, -1, L"steamwebhelper.exe", -1, TRUE) ==
-                    CSTR_EQUAL)
-                {
-                    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pProcessInfo[i].ProcessId);
-                    PROCESS_BASIC_INFORMATION pbi = {};
-                    NtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), NULL);
-                    CloseHandle(hProcess);
-
-                    pid[n] = pProcessInfo[i].ProcessId;
-                    parent[n] = (DWORD)pbi.InheritedFromUniqueProcessId;
-                    n++;
-                }
-            WTSFreeMemory(pProcessInfo);
-
-            // not every webhelper process is a direct child of steam.exe, some are spawned by
-            // other webhelper processes (sandboxed renderers and the like), so we walk the
-            // whole chain instead of just checking the immediate parent. n is small (a handful
-            // of processes), so the extra passes here cost nothing
-            BOOL rooted[MAX_HELPERS] = {};
-            for (DWORD i = {}; i < n; i++)
-                rooted[i] = parent[i] == GetCurrentProcessId();
-            for (DWORD pass = {}; pass < n; pass++)
-                for (DWORD i = {}; i < n; i++)
-                    if (!rooted[i])
-                        for (DWORD j = {}; j < n; j++)
-                            if (rooted[j] && parent[i] == pid[j])
-                                rooted[i] = TRUE;
-
-            for (DWORD i = {}; i < n && cParked < MAX_HELPERS; i++)
-                if (rooted[i])
-                {
-                    // PROCESS_TERMINATE is only used by the kill mode build, harmless to
-                    // request it here too since this file is shared between both builds
-                    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION |
-                                                       PROCESS_SET_QUOTA | PROCESS_TERMINATE,
-                                                   FALSE, pid[i]);
-                    if (hProcess)
-                    {
-                        Park(hProcess);
-                        hParked[cParked++] = hProcess;
-                    }
-                }
-            bParked = TRUE;
-
 #ifndef KILL_MODE
-            TRIM_CTX *ctx = HeapAlloc(GetProcessHeap(), 0, sizeof(TRIM_CTX));
-            if (ctx)
+    // park mode only needs to notice park mode isn't a fight against steam the way kill mode
+    // is, so there's nothing undoing our work on its own. but with nothing retrimming while
+    // parked, a parked process's memory just creeps back up over a long session with no
+    // registry write to wake us and catch it. this event lets RegNotifyChangeKeyValue be
+    // waited on with a timeout, so there's always somewhere to retrim periodically even when
+    // nothing's actually changed
+    HANDLE hEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+#endif
+
+    // the inner loop below used to just end the whole thread for good the moment
+    // RegNotifyChangeKeyValue returned an error, trusting it to never do that. it does: a
+    // real test showed watching stop dead after exactly one successful kill, mid game, with
+    // no way to recover short of restarting steam. this outer loop means a watch that goes
+    // bad just gets reopened and restarted instead of silently giving up for the rest of the
+    // session
+    for (;;)
+    {
+        HKEY hKey = NULL;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE\\Valve\\Steam", REG_OPTION_NON_VOLATILE,
+                           KEY_NOTIFY | KEY_QUERY_VALUE, &hKey) != ERROR_SUCCESS)
+        {
+            Sleep(1000);
+            continue;
+        }
+
+#ifdef KILL_MODE
+        while (!RegNotifyChangeKeyValue(hKey, FALSE, REG_NOTIFY_CHANGE_LAST_SET, NULL, FALSE))
+        {
+#else
+        for (;;)
+        {
+            if (RegNotifyChangeKeyValue(hKey, FALSE, REG_NOTIFY_CHANGE_LAST_SET, hEvent, TRUE) != ERROR_SUCCESS)
+                break;
+
+            if (WaitForSingleObject(hEvent, bParked ? 1000 : INFINITE) == WAIT_TIMEOUT)
             {
                 for (DWORD i = {}; i < cParked; i++)
-                    ctx->h[i] = hParked[i];
-                ctx->n = cParked;
-                ctx->epoch = InterlockedIncrement(&g_epoch);
-                CloseHandle(CreateThread(NULL, 0, RetrimProc, ctx, 0, NULL));
+                    SetProcessWorkingSetSize(hParked[i], (SIZE_T)-1, (SIZE_T)-1);
+                continue;
             }
 #endif
-        }
-        else if (!_ && bParked)
-        {
-#ifndef KILL_MODE
-            InterlockedIncrement(&g_epoch);
-#endif
-            for (DWORD i = {}; i < cParked; i++)
+            BOOL _ = FALSE;
+            RegGetValueW(hKey, NULL, L"RunningAppID", RRF_RT_REG_DWORD, NULL, (PVOID)&_, &((DWORD){sizeof(BOOL)}));
+
+            // re-sweep every time steam says an app is running, not just the first time we
+            // notice. games with their own pre-launch menu (settings, server browser,
+            // whatever) make steam flip RunningAppID off and back on during the handoff to
+            // the real game, and if that happens fast enough we only get woken once, after
+            // it's already back on, looking like nothing changed. re-parking unconditionally
+            // here means that wakeup still catches and re-kills (or re-trims) whatever steam
+            // brought back during the gap, instead of only acting the first time we see the
+            // app turn on
+            if (_)
             {
-                Unpark(hParked[i]);
-                CloseHandle(hParked[i]);
+#ifdef KILL_MODE
+                if (!bParked)
+                    SuspendThread(hThread);
+#endif
+                for (DWORD i = {}; i < cParked; i++)
+                    CloseHandle(hParked[i]);
+                cParked = ParkDescendants(hParked);
+                bParked = TRUE;
             }
-            cParked = 0;
-            bParked = FALSE;
+            else if (bParked)
+            {
+#ifdef KILL_MODE
+                ResumeThread(hThread);
+#endif
+                for (DWORD i = {}; i < cParked; i++)
+                {
+                    Unpark(hParked[i]);
+                    CloseHandle(hParked[i]);
+                }
+                cParked = 0;
+                bParked = FALSE;
+            }
         }
+        RegCloseKey(hKey);
     }
     return EXIT_SUCCESS;
 }
@@ -251,7 +285,7 @@ static VOID CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND
         return;
 
     CloseHandle(CreateThread(NULL, 0, ThreadProc, (LPVOID)FALSE, 0, NULL));
-    CloseHandle(CreateThread(NULL, 0, MonitorProc, NULL, 0, NULL));
+    CloseHandle(CreateThread(NULL, 0, MonitorProc, (LPVOID)(ULONG_PTR)dwEventThread, 0, NULL));
 }
 
 static DWORD WINAPI ThreadProc(LPVOID lpParameter)
