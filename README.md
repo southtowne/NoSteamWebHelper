@@ -19,6 +19,11 @@ Simply follow the quick and easy steps below ↓
 4. Copy umpdc.dll from the park folder (or kill, if that's what you want) into your Steam install directory, next to steam.exe.
 5. Start Steam normally.
 
+# Which do I use?
+Use **kill** if you never use the Steam overlay or Steam's browser UI while gaming. It kills WebHelper when a game starts. The trade-off: Steam's own window freezes while a game is running, and the overlay won't work at all. If you don't touch either of those during a session, there's no downside.
+
+Use **park** if you want the overlay to keep working. Instead of killing WebHelper, it deprioritizes it and keeps trimming its memory for as long as a game runs, while leaving Steam's window and the overlay fully responsive. This won't get usage all the way to zero - it's mitigating the cost of a feature, not removing it.
+
 # Optional Build instructions:
 
 1. Prerequisites: Windows 10/11 x64, a mingw-w64 GCC toolchain on PATH (scoop install gcc, or MSYS2's UCRT64 shell with pacman -S mingw-w64-ucrt-x86_64-gcc).
